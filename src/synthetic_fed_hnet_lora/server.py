@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 
+from contrastive_utils import supervised_contrastive_loss
 from hypernet import HyperNet, mse_match_loss
 
 
@@ -50,6 +51,7 @@ class Server:
         if self.learnable_embeddings:
             opt_params += list(self.emb.parameters())
         self.opt = torch.optim.AdamW(opt_params, lr=lr, weight_decay=1e-4)
+        self.grad_tracker = None  # optional GradVarianceTracker, set externally
 
     def _embed(self, ids: torch.Tensor) -> torch.Tensor:
         learned = self.emb(ids)
@@ -59,17 +61,62 @@ class Server:
             return learned + self.client_features[ids]
         return self.client_features[ids]
 
-    def update_from_deltas(self, client_ids, delta_targets_cpu):
+    def update_from_adapters(
+        self,
+        client_ids,
+        adapter_targets_cpu,
+        contrastive_labels=None,
+        use_contrastive_loss: bool = False,
+        contrastive_weight: float = 0.0,
+        contrastive_temperature: float = 0.2,
+        contrastive_mode: str = "supervised_regime",
+        return_details: bool = False,
+    ):
         ids = torch.tensor(client_ids, device=self.device, dtype=torch.long)
-        pred = self.hnet(self._embed(ids))
-        delta = torch.stack([delta_targets_cpu[i].to(self.device) for i in client_ids], dim=0)
+        embeddings = self._embed(ids)
+        pred = self.hnet(embeddings)
+        target = torch.stack([adapter_targets_cpu[i].to(self.device) for i in client_ids], dim=0)
 
-        loss = mse_match_loss(pred, delta)
+        base_loss = mse_match_loss(pred, target)
+        contrastive_loss = pred.new_zeros(())
+        contrastive_info = {
+            "contrastive_batch_size": int(len(client_ids)),
+            "contrastive_positive_anchors": 0,
+            "contrastive_positive_pairs": 0,
+            "contrastive_temperature": float(contrastive_temperature),
+            "contrastive_mode": contrastive_mode,
+        }
+
+        if use_contrastive_loss:
+            if contrastive_labels is None:
+                raise ValueError("contrastive_labels are required when use_contrastive_loss=True")
+            contrastive_loss, contrastive_info = supervised_contrastive_loss(
+                embeddings=embeddings,
+                labels=torch.as_tensor(contrastive_labels, device=self.device),
+                temperature=contrastive_temperature,
+                mode=contrastive_mode,
+            )
+
+        total_loss = base_loss + float(contrastive_weight) * contrastive_loss
 
         self.opt.zero_grad(set_to_none=True)
-        loss.backward()
+        total_loss.backward()
+        if self.grad_tracker is not None:
+            self.grad_tracker.update(self.hnet)
         self.opt.step()
-        return float(loss.item())
+
+        out = {
+            "server_target_loss": float(base_loss.item()),
+            "server_contrastive_loss": float(contrastive_loss.item()),
+            "server_contrastive_weighted_loss": float(
+                float(contrastive_weight) * contrastive_loss.item()
+            ),
+            "server_total_loss": float(total_loss.item()),
+        }
+        out.update(contrastive_info)
+        if return_details:
+            return out
+        return out["server_target_loss"]
 
     def update_from_targets(self, client_ids, target_flats_cpu):
         ids = torch.tensor(client_ids, device=self.device, dtype=torch.long)
@@ -79,6 +126,8 @@ class Server:
 
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
+        if self.grad_tracker is not None:
+            self.grad_tracker.update(self.hnet)
         self.opt.step()
         return float(loss.item())
 
@@ -93,12 +142,24 @@ class Server:
         Returns:  [B, flat_dim]
         """
         feats = features.to(self.device).float()
-        return self.hnet(feats)
+        was_training = self.hnet.training
+        self.hnet.eval()
+        try:
+            return self.hnet(feats)
+        finally:
+            if was_training:
+                self.hnet.train()
 
     @torch.no_grad()
     def generate_lora_flat(self, client_ids):
         ids = torch.tensor(client_ids, device=self.device, dtype=torch.long)
-        return self.hnet(self._embed(ids))
+        was_training = self.hnet.training
+        self.hnet.eval()
+        try:
+            return self.hnet(self._embed(ids))
+        finally:
+            if was_training:
+                self.hnet.train()
 
     def save(self, out_dir):
         os.makedirs(out_dir, exist_ok=True)

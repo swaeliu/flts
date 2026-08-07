@@ -41,6 +41,47 @@ def _get_synth_shape(cfg) -> Tuple[int, int, int]:
     return n_regimes, n_variants, n_clients
 
 
+BASIC_DESCRIPTOR_FEATURE_NAMES = (
+    "trend_slope",
+    "exp_trend_strength",
+    "season_period_1",
+    "season_amp_1",
+    "season_period_2",
+    "season_amp_2",
+    "ar_coef_1",
+    "ar_coef_2",
+    "ar_coef_3",
+    "noise_scale",
+    "heteroskedasticity",
+    "level_shift",
+    "piecewise_trend",
+    "kernel_linear",
+    "kernel_rbf",
+    "kernel_periodic",
+    "kernel_noise",
+)
+
+SPECTRAL_DESCRIPTOR_FEATURE_NAMES = (
+    "series_std",
+    "series_amplitude",
+    "dominant_frequency",
+    "spectral_entropy",
+    "low_freq_power_ratio",
+    "high_freq_power_ratio",
+    "trend_strength",
+    "seasonality_strength",
+)
+
+
+def get_descriptor_feature_names(descriptor_set: str = "basic") -> Tuple[str, ...]:
+    descriptor_set = str(descriptor_set).lower()
+    if descriptor_set == "basic":
+        return BASIC_DESCRIPTOR_FEATURE_NAMES
+    if descriptor_set == "spectral":
+        return BASIC_DESCRIPTOR_FEATURE_NAMES + SPECTRAL_DESCRIPTOR_FEATURE_NAMES
+    raise ValueError(f"Unknown descriptor_set: {descriptor_set}")
+
+
 class SyntheticWindowDataset(Dataset):
     def __init__(
         self,
@@ -113,9 +154,18 @@ def split_series_gift_style(
     test_len = max(horizon + seq_len, int(round(test_frac * n)))
     test_start = max(seq_len + 1, n - test_len)
 
-    train = s[:test_start]
-    val = s[:test_start]
-    test = s[max(0, test_start - seq_len) :]
+    # Hold out the last `horizon` points before the test region as the val
+    # forecast target. Val windows may share context with train, but their
+    # targets are never trained on — otherwise val loss is in-sample and
+    # patience/early-stopping cannot see overfitting.
+    val_start = test_start - (seq_len + horizon)
+    train_end = test_start - horizon
+    if val_start < 0 or train_end < seq_len + horizon:
+        return None, None, None
+
+    train = s[:train_end]
+    val = s[val_start:test_start]
+    test = s[max(0, test_start - seq_len):]
     return train, val, test
 
 
@@ -189,7 +239,12 @@ def _rbf_kernel(t: np.ndarray, variance: float, lengthscale: float) -> np.ndarra
     return variance * np.exp(-0.5 * (diff / max(lengthscale, 1e-3)) ** 2)
 
 
-def _periodic_kernel(t: np.ndarray, variance: float, period: float, lengthscale: float) -> np.ndarray:
+def _periodic_kernel(
+    t: np.ndarray,
+    variance: float,
+    period: float,
+    lengthscale: float,
+) -> np.ndarray:
     diff = np.abs(t[:, None] - t[None, :])
     s = np.sin(math.pi * diff / max(period, 1e-3))
     return variance * np.exp(-2.0 * (s**2) / max(lengthscale, 1e-3) ** 2)
@@ -292,127 +347,6 @@ def simulate_ar_series(
     return x.astype(np.float32)
 
 
-def _make_regime_params(
-    regime_id: int,
-    variant_id: int,
-    n_regimes: int,
-    seed: int,
-) -> Dict[str, float]:
-    frac = regime_id / max(n_regimes - 1, 1)
-    base = {
-        "trend_slope": -0.03 + 0.06 * frac,
-        "exp_trend_strength": 0.00 + 0.03 * ((regime_id % 5) / 4.0),
-        "season_period_1": 12 + 36 * frac,
-        "season_amp_1": 0.3 + 1.0 * ((regime_id % 7) / 6.0),
-        "season_period_2": 48 + 96 * (1.0 - frac),
-        "season_amp_2": 0.0 + 0.5 * ((regime_id % 3) / 2.0),
-        "ar_coef_1": 0.10 + 0.45 * ((regime_id % 6) / 5.0),
-        "ar_coef_2": -0.20 + 0.40 * (((regime_id + 2) % 7) / 6.0),
-        "ar_coef_3": -0.10 + 0.20 * (((regime_id + 3) % 5) / 4.0),
-        "noise_scale": 0.03 + 0.15 * (((regime_id * 3) % 10) / 9.0),
-        "heteroskedasticity": 0.0 + 0.5 * (((regime_id * 5) % 9) / 8.0),
-        "level_shift": -1.0 + 2.0 * (((regime_id * 7) % 11) / 10.0),
-        "piecewise_trend": -0.02 + 0.04 * (((regime_id * 11) % 13) / 12.0),
-    }
-
-    rng = np.random.default_rng(seed + 10000 + regime_id * 101 + variant_id)
-    out = dict(base)
-
-    for k, v in base.items():
-        scale = 0.10 * abs(v) + 0.01
-        out[k] = float(v + rng.normal(0.0, scale))
-
-    out["noise_scale"] = float(np.clip(out["noise_scale"], 1e-4, 5.0))
-    out["heteroskedasticity"] = float(np.clip(out["heteroskedasticity"], 0.0, 2.0))
-    out["exp_trend_strength"] = float(np.clip(out["exp_trend_strength"], 0.0, 0.25))
-    out["season_period_1"] = float(np.clip(out["season_period_1"], 2.0, 512.0))
-    out["season_period_2"] = float(np.clip(out["season_period_2"], 2.0, 1024.0))
-    out["season_amp_1"] = float(np.clip(out["season_amp_1"], 0.0, 5.0))
-    out["season_amp_2"] = float(np.clip(out["season_amp_2"], 0.0, 5.0))
-
-    ar = np.array(
-        [out["ar_coef_1"], out["ar_coef_2"], out["ar_coef_3"]],
-        dtype=np.float64,
-    )
-    ar_sum = np.sum(np.abs(ar))
-    if ar_sum >= 0.95:
-        ar = ar * (0.95 / max(ar_sum, 1e-8))
-    out["ar_coef_1"], out["ar_coef_2"], out["ar_coef_3"] = [float(a) for a in ar]
-
-    return out
-
-
-def _base_regime_series(
-    rng: np.random.Generator,
-    length: int,
-    params: Dict[str, float],
-) -> np.ndarray:
-    t = np.arange(length, dtype=np.float64)
-    t01 = np.linspace(0.0, 1.0, length, dtype=np.float64)
-    x = np.zeros(length, dtype=np.float64)
-
-    noise_scale = max(float(params["noise_scale"]), 1e-6)
-    het_strength = max(float(params["heteroskedasticity"]), 0.0)
-    season_period_1 = max(float(params["season_period_1"]), 2.0)
-    season_period_2 = max(float(params["season_period_2"]), 2.0)
-    season_amp_1 = max(float(params["season_amp_1"]), 0.0)
-    season_amp_2 = max(float(params["season_amp_2"]), 0.0)
-
-    x += float(params["trend_slope"]) * t01 * length
-
-    exp_part = float(params["exp_trend_strength"]) * (
-        np.exp(np.clip(1.5 * t01, -2.0, 2.0)) - 1.0
-    )
-    x += np.clip(exp_part, -10.0, 10.0)
-
-    x += season_amp_1 * np.sin(2.0 * np.pi * t / season_period_1)
-    x += season_amp_2 * np.cos(2.0 * np.pi * t / season_period_2)
-
-    ar = simulate_ar_series(
-        rng,
-        length,
-        [params["ar_coef_1"], params["ar_coef_2"], params["ar_coef_3"]],
-        noise_scale,
-    )
-    x += ar.astype(np.float64)
-
-    cut = int(0.55 * length)
-    x[cut:] += float(params["level_shift"])
-    x[cut:] += float(params["piecewise_trend"]) * np.arange(length - cut, dtype=np.float64)
-
-    het = 1.0 + het_strength * t01
-    noise = rng.normal(0.0, noise_scale, size=length).astype(np.float64)
-    x += noise * het
-
-    return _sanitize_series(x)
-
-
-def tsmixup(
-    rng: np.random.Generator,
-    base_series: List[np.ndarray],
-    out_count: int,
-    max_k: int = 3,
-    alpha: float = 0.7,
-) -> List[np.ndarray]:
-    if not base_series:
-        return []
-
-    series_len = len(base_series[0])
-    out = []
-
-    for _ in range(out_count):
-        k = int(rng.integers(1, max_k + 1))
-        idx = rng.choice(len(base_series), size=k, replace=True)
-        lam = rng.dirichlet(alpha=np.full(k, alpha, dtype=np.float64))
-        mix = np.zeros(series_len, dtype=np.float64)
-        for w, i in zip(lam, idx):
-            s = _sanitize_series(base_series[int(i)])
-            mix += float(w) * s.astype(np.float64)
-        out.append(_sanitize_series(mix))
-
-    return out
-
-
 def _safe_corrcoef(x: np.ndarray, y: np.ndarray) -> float:
     x = np.asarray(x, dtype=np.float64).reshape(-1)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
@@ -456,11 +390,12 @@ def _estimate_dominant_period(x: np.ndarray, max_period: int = 128) -> float:
     return float(np.clip(period, 1.0, max_period))
 
 
-def _estimate_window_features(x: np.ndarray) -> np.ndarray:
+def _estimate_window_features(x: np.ndarray, descriptor_set: str = "basic") -> np.ndarray:
     x = np.asarray(x, dtype=np.float64).reshape(-1)
     n = x.size
+    feature_dim = len(get_descriptor_feature_names(descriptor_set))
     if n < 4:
-        return np.zeros(17, dtype=np.float32)
+        return np.zeros(feature_dim, dtype=np.float32)
 
     t = np.arange(n, dtype=np.float64)
     t_center = t - t.mean()
@@ -543,6 +478,48 @@ def _estimate_window_features(x: np.ndarray) -> np.ndarray:
         ],
         dtype=np.float32,
     )
+
+    if descriptor_set == "spectral":
+        freqs = np.fft.rfftfreq(n, d=1.0)
+        power_tail = power[1:] if power.size > 1 else np.zeros(0, dtype=np.float64)
+        freq_tail = freqs[1:] if freqs.size > 1 else np.zeros(0, dtype=np.float64)
+        signal_var = float(np.var(x_center))
+        residual_var = float(np.var(resid))
+
+        series_std = float(np.std(x))
+        series_amplitude = float(np.percentile(x, 95) - np.percentile(x, 5))
+        dominant_frequency = 1.0 / max(season_period_1, 1.0)
+        seasonality_strength = kernel_periodic
+        trend_strength = max(0.0, 1.0 - residual_var / max(signal_var, 1e-12))
+
+        if power_tail.size and total_power > 1e-12:
+            power_dist = power_tail / total_power
+            spectral_entropy = float(
+                -np.sum(power_dist * np.log(power_dist + 1e-12))
+                / max(np.log(power_dist.size + 1e-12), 1e-12)
+            )
+            low_freq_power_ratio = float(power_tail[freq_tail <= 0.10].sum() / total_power)
+            high_freq_power_ratio = float(power_tail[freq_tail >= 0.25].sum() / total_power)
+        else:
+            spectral_entropy = 0.0
+            low_freq_power_ratio = 0.0
+            high_freq_power_ratio = 0.0
+
+        spectral_feat = np.array(
+            [
+                series_std,
+                series_amplitude,
+                dominant_frequency,
+                spectral_entropy,
+                low_freq_power_ratio,
+                high_freq_power_ratio,
+                trend_strength,
+                seasonality_strength,
+            ],
+            dtype=np.float32,
+        )
+        feat = np.concatenate([feat, spectral_feat], axis=0)
+
     feat = np.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
     return feat
 
@@ -551,40 +528,577 @@ def estimate_client_feature_vector_from_series_list(
     series_list: List[np.ndarray],
     seq_len: int,
     max_windows_per_series: int = 8,
+    descriptor_set: str = "basic",
+    min_window: int = 64,
 ) -> torch.Tensor:
-
     feats: List[np.ndarray] = []
 
     for s in series_list:
         s = np.asarray(s, dtype=np.float32).reshape(-1)
-        if s.size < max(seq_len, 8):
+        s = s[np.isfinite(s)]
+        # Shrink the window to the series length rather than skipping short
+        # series — skipping made all-short datasets collapse to an all-zero
+        # descriptor and hence one shared adapter.
+        if s.size < min_window:
             continue
+        win_len = min(seq_len, s.size)
 
-        if s.size <= seq_len:
+        if s.size <= win_len:
             starts = [0]
         else:
-            max_start = s.size - seq_len
+            max_start = s.size - win_len
             num = min(max_windows_per_series, max_start + 1)
             starts = np.linspace(0, max_start, num=num, dtype=int).tolist()
 
         for st in starts:
-            win = s[st : st + seq_len]
-            if win.size < seq_len:
-                continue
-            feats.append(_estimate_window_features(win))
+            win = s[st: st + win_len].astype(np.float64)
+            # z-normalize each window so descriptors are scale-free; raw
+            # windows put real (non-unit-scale) data far outside the
+            # synthetic training support.
+            sd = float(win.std())
+            win = (win - float(win.mean())) / max(sd, 1e-8)
+            feats.append(_estimate_window_features(win, descriptor_set=descriptor_set))
 
     if not feats:
-        return torch.zeros(17, dtype=torch.float32)
+        return torch.zeros(len(get_descriptor_feature_names(descriptor_set)), dtype=torch.float32)
 
     arr = np.stack(feats, axis=0).mean(axis=0)
     return torch.from_numpy(arr).float()
 
 
+def _regime_separability_profile(level: str) -> Dict[str, float]:
+    level = str(level).lower()
+    if level == "easy":
+        return {
+            "center_scale": 1.6,
+            "jitter_scale": 0.60,
+            "contrast_scale": 1.20,
+        }
+    if level == "hard":
+        return {
+            "center_scale": 0.55,
+            "jitter_scale": 1.60,
+            "contrast_scale": 0.65,
+        }
+    return {
+        "center_scale": 1.0,
+        "jitter_scale": 1.0,
+        "contrast_scale": 1.0,
+    }
+
+
+def _regime_family(regime_id: int) -> str:
+    families = [
+        "trend_seasonal",
+        "sarima_like",
+        "long_memory",
+        "smooth_seasonal",
+        "low_frequency",
+        "multiplicative_seasonal",
+        "high_frequency",
+    ]
+    return families[regime_id % len(families)]
+
+
+def _make_regime_params(
+    regime_id: int,
+    variant_id: int,
+    n_regimes: int,
+    seed: int,
+    config_variant: str = "baseline",
+    separability: str = "medium",
+) -> Dict[str, float]:
+    frac = regime_id / max(n_regimes - 1, 1)
+    family = _regime_family(regime_id)
+    sep = _regime_separability_profile(separability)
+    center_scale = sep["center_scale"]
+
+    base = {
+        "trend_slope": -0.03 * center_scale + 0.06 * center_scale * frac,
+        "exp_trend_strength": 0.00 + 0.03 * ((regime_id % 5) / 4.0),
+        "season_period_1": 12 + 36 * center_scale * frac,
+        "season_amp_1": 0.3 + 1.0 * center_scale * ((regime_id % 7) / 6.0),
+        "season_period_2": 48 + 96 * center_scale * (1.0 - frac),
+        "season_amp_2": 0.0 + 0.5 * center_scale * ((regime_id % 3) / 2.0),
+        "ar_coef_1": 0.10 + 0.45 * ((regime_id % 6) / 5.0),
+        "ar_coef_2": -0.20 + 0.40 * (((regime_id + 2) % 7) / 6.0),
+        "ar_coef_3": -0.10 + 0.20 * (((regime_id + 3) % 5) / 4.0),
+        "noise_scale": 0.03 + 0.15 * center_scale * (((regime_id * 3) % 10) / 9.0),
+        "heteroskedasticity": 0.0 + 0.5 * center_scale * (((regime_id * 5) % 9) / 8.0),
+        "level_shift": -1.0 * center_scale + 2.0 * center_scale * (((regime_id * 7) % 11) / 10.0),
+        "piecewise_trend": -0.02 * center_scale + 0.04 * center_scale * (((regime_id * 11) % 13) / 12.0),
+        "family_id": float(regime_id % 5),
+        "downsample_factor": 1.0,
+        "seasonal_ar_1": 0.0,
+        "seasonal_ar_2": 0.0,
+        "long_memory_strength": 0.0,
+        "smoothness_strength": 0.0,
+    }
+
+    rng = np.random.default_rng(seed + 10000 + regime_id * 101 + variant_id)
+    out = dict(base)
+
+    for k, v in base.items():
+        if k in {"family_id", "downsample_factor"}:
+            continue
+        scale = (0.10 * abs(v) + 0.01) * sep["jitter_scale"]
+        out[k] = float(v + rng.normal(0.0, scale))
+
+    if family == "trend_seasonal":
+        out["season_amp_1"] *= 1.25
+        out["season_amp_2"] *= 1.10
+        out["noise_scale"] *= 0.9
+
+    elif family == "sarima_like":
+        out["season_period_1"] = float(rng.choice([12, 24, 48, 96]))
+        out["season_amp_1"] *= 1.1
+        out["seasonal_ar_1"] = float(rng.uniform(0.15, 0.55))
+        out["seasonal_ar_2"] = float(rng.uniform(-0.20, 0.20))
+        out["ar_coef_1"] = float(rng.uniform(0.20, 0.60))
+        out["ar_coef_2"] = float(rng.uniform(-0.25, 0.15))
+        out["noise_scale"] *= 0.95
+
+    elif family == "long_memory":
+        out["long_memory_strength"] = float(rng.uniform(0.35, 0.85))
+        out["noise_scale"] *= 0.7
+        out["season_amp_1"] *= 0.8
+        out["season_amp_2"] *= 0.6
+        out["ar_coef_1"] = float(rng.uniform(0.15, 0.35))
+        out["ar_coef_2"] = float(rng.uniform(0.05, 0.20))
+        out["ar_coef_3"] = float(rng.uniform(0.00, 0.10))
+
+    elif family == "smooth_seasonal":
+        out["smoothness_strength"] = float(rng.uniform(0.7, 1.3))
+        out["season_period_1"] = float(rng.choice([24, 48, 72, 96, 168]))
+        out["season_period_2"] = float(rng.choice([48, 96, 168, 336]))
+        out["season_amp_1"] = float(rng.uniform(0.8, 1.8))
+        out["season_amp_2"] = float(rng.uniform(0.2, 1.0))
+        out["noise_scale"] = float(rng.uniform(0.01, 0.05))
+        out["heteroskedasticity"] *= 0.25
+        out["trend_slope"] *= 0.5
+        out["piecewise_trend"] *= 0.25
+
+    elif family == "low_frequency":
+        out["downsample_factor"] = float(rng.choice([2, 4, 7, 12, 24]))
+        out["season_period_1"] = float(rng.choice([6, 12, 24, 52]))
+        out["season_period_2"] = float(rng.choice([12, 24, 52, 104]))
+        out["season_amp_1"] = float(rng.uniform(0.4, 1.4))
+        out["season_amp_2"] = float(rng.uniform(0.0, 0.8))
+        out["noise_scale"] *= 0.85
+        out["smoothness_strength"] = float(rng.uniform(0.4, 1.0))
+
+    elif family == "multiplicative_seasonal":
+        # Log-space seasonal with level-proportional noise.
+        # Mimics sales, energy demand, and web traffic where variance scales with level.
+        out["season_period_1"] = float(rng.choice([4, 6, 8, 12, 24]))
+        out["season_amp_1"] = float(rng.uniform(0.4, 1.2))
+        out["season_period_2"] = float(rng.choice([24, 48, 52, 104]))
+        out["season_amp_2"] = float(rng.uniform(0.1, 0.6))
+        out["noise_scale"] = float(rng.uniform(0.03, 0.20))
+        out["heteroskedasticity"] = float(rng.uniform(0.4, 1.5))
+        out["exp_trend_strength"] = float(rng.uniform(0.0, 0.15))
+        out["trend_slope"] *= 0.4
+        out["ar_coef_1"] = float(rng.uniform(0.25, 0.65))
+        out["ar_coef_2"] = float(rng.uniform(-0.20, 0.20))
+        out["ar_coef_3"] = float(rng.uniform(-0.10, 0.10))
+        out["level_shift"] *= 0.3
+        out["piecewise_trend"] *= 0.2
+
+    elif family == "high_frequency":
+        # Short seasonal periods and strong local AR to expose the model to
+        # short-cycle dynamics, improving short-horizon forecast accuracy.
+        out["season_period_1"] = float(rng.choice([2, 3, 4, 6, 8]))
+        out["season_amp_1"] = float(rng.uniform(0.5, 1.5))
+        out["season_period_2"] = float(rng.choice([4, 6, 8, 12, 16]))
+        out["season_amp_2"] = float(rng.uniform(0.2, 0.8))
+        out["ar_coef_1"] = float(rng.uniform(0.50, 0.85))
+        out["ar_coef_2"] = float(rng.uniform(-0.40, -0.05))
+        out["ar_coef_3"] = float(rng.uniform(-0.20, 0.10))
+        out["noise_scale"] = float(rng.uniform(0.05, 0.25))
+        out["trend_slope"] *= 0.2
+        out["exp_trend_strength"] = 0.0
+        out["heteroskedasticity"] *= 0.3
+        out["level_shift"] *= 0.2
+        out["piecewise_trend"] *= 0.1
+        out["long_memory_strength"] = 0.0
+
+    for k, v in base.items():
+        if k in {"family_id", "downsample_factor"}:
+            continue
+        out[k] = float(v + sep["contrast_scale"] * (out[k] - v))
+
+    out["family"] = family
+    out["noise_scale"] = float(np.clip(out["noise_scale"], 1e-4, 5.0))
+    out["heteroskedasticity"] = float(np.clip(out["heteroskedasticity"], 0.0, 2.0))
+    out["exp_trend_strength"] = float(np.clip(out["exp_trend_strength"], 0.0, 0.25))
+    out["season_period_1"] = float(np.clip(out["season_period_1"], 2.0, 1024.0))
+    out["season_period_2"] = float(np.clip(out["season_period_2"], 2.0, 2048.0))
+    out["season_amp_1"] = float(np.clip(out["season_amp_1"], 0.0, 5.0))
+    out["season_amp_2"] = float(np.clip(out["season_amp_2"], 0.0, 5.0))
+    out["downsample_factor"] = float(np.clip(out["downsample_factor"], 1.0, 48.0))
+
+    ar = np.array(
+        [out["ar_coef_1"], out["ar_coef_2"], out["ar_coef_3"]],
+        dtype=np.float64,
+    )
+    ar_sum = np.sum(np.abs(ar))
+    if ar_sum >= 0.95:
+        ar = ar * (0.95 / max(ar_sum, 1e-8))
+    out["ar_coef_1"], out["ar_coef_2"], out["ar_coef_3"] = [float(a) for a in ar]
+
+    # The sarima_like family adds seasonal AR terms (Phi1, Phi2) that the check
+    # above ignores. Their combined contribution can push the effective root above
+    # 1.0, causing the process to converge to a float-precision fixed point within
+    # the series length (last ~20% becomes a flat constant). Cap the combined
+    # non-seasonal + seasonal sum at 0.60 to keep mean-reversion fast enough.
+    if out.get("family") == "sarima_like":
+        s_ar_keys = ["ar_coef_1", "ar_coef_2", "ar_coef_3", "seasonal_ar_1", "seasonal_ar_2"]
+        combined = sum(abs(out.get(k, 0.0)) for k in s_ar_keys)
+        if combined >= 0.60:
+            scale = 0.60 / combined
+            for k in s_ar_keys:
+                if k in out:
+                    out[k] = float(out[k] * scale)
+
+    # sarima_only forces all regimes to use the sarima_like family regardless of regime_id
+    if config_variant == "sarima_only":
+        out["season_period_1"] = float(rng.choice([12, 24, 48, 96]))
+        out["season_amp_1"] = float(rng.uniform(0.5, 1.5))
+        out["seasonal_ar_1"] = float(rng.uniform(0.15, 0.55))
+        out["seasonal_ar_2"] = float(rng.uniform(-0.20, 0.20))
+        out["ar_coef_1"] = float(rng.uniform(0.20, 0.60))
+        out["ar_coef_2"] = float(rng.uniform(-0.25, 0.15))
+        out["noise_scale"] *= 0.95
+        out["family"] = "sarima_like"
+
+    # Apply config variant modifications
+    if config_variant == "low_trend":
+        out["trend_slope"] = 0.0
+        out["exp_trend_strength"] = 0.0
+        out["piecewise_trend"] = 0.0
+    elif config_variant == "high_noise":
+        out["noise_scale"] = float(np.clip(out["noise_scale"] * 3.0, 1e-4, 5.0))
+    elif config_variant == "high_seasonality":
+        out["season_amp_1"] = float(np.clip(out["season_amp_1"] * 2.0, 0.0, 5.0))
+        out["season_amp_2"] = float(np.clip(out["season_amp_2"] * 2.0, 0.0, 5.0))
+    elif config_variant == "extreme_trend":
+        out["trend_slope"] = 0.5
+        out["exp_trend_strength"] = 0.15
+        out["piecewise_trend"] = 0.2
+    elif config_variant == "extreme_seasonality":
+        out["season_amp_1"] = 5.0
+        out["season_amp_2"] = 3.0
+    elif config_variant == "extreme_noise":
+        out["noise_scale"] = float(np.clip(2.0, 1e-4, 5.0))
+    elif config_variant == "structural_breaks":
+        out["level_shift"] = 5.0
+        out["piecewise_trend"] = 0.2
+
+    return out
+
+
+def _base_regime_series(
+    rng: np.random.Generator,
+    length: int,
+    params: Dict[str, float],
+) -> np.ndarray:
+    t = np.arange(length, dtype=np.float64)
+    t01 = np.linspace(0.0, 1.0, length, dtype=np.float64)
+    x = np.zeros(length, dtype=np.float64)
+
+    noise_scale = max(float(params["noise_scale"]), 1e-6)
+    het_strength = max(float(params["heteroskedasticity"]), 0.0)
+    season_period_1 = max(float(params["season_period_1"]), 2.0)
+    season_period_2 = max(float(params["season_period_2"]), 2.0)
+    season_amp_1 = max(float(params["season_amp_1"]), 0.0)
+    season_amp_2 = max(float(params["season_amp_2"]), 0.0)
+
+    x += float(params["trend_slope"]) * t01 * length
+
+    exp_part = float(params["exp_trend_strength"]) * (
+        np.exp(np.clip(1.5 * t01, -2.0, 2.0)) - 1.0
+    )
+    x += np.clip(exp_part, -10.0, 10.0)
+
+    x += season_amp_1 * np.sin(2.0 * np.pi * t / season_period_1)
+    x += season_amp_2 * np.cos(2.0 * np.pi * t / season_period_2)
+
+    ar = simulate_ar_series(
+        rng,
+        length,
+        [params["ar_coef_1"], params["ar_coef_2"], params["ar_coef_3"]],
+        noise_scale,
+    )
+    x += ar.astype(np.float64)
+
+    cut = int(0.55 * length)
+    x[cut:] += float(params["level_shift"])
+    x[cut:] += float(params["piecewise_trend"]) * np.arange(length - cut, dtype=np.float64)
+
+    het = 1.0 + het_strength * t01
+    noise = rng.normal(0.0, noise_scale, size=length).astype(np.float64)
+    x += noise * het
+
+    return _sanitize_series(x)
+
+
+def _simulate_sarima_like_series(
+    rng: np.random.Generator,
+    length: int,
+    params: Dict[str, float],
+) -> np.ndarray:
+    p1 = max(int(round(params["season_period_1"])), 2)
+    x = np.zeros(length, dtype=np.float64)
+    noise_scale = max(float(params["noise_scale"]), 1e-6)
+
+    # Do NOT multiply by length here. The AR feedback loop amplifies a large
+    # trend into the clip boundary, trapping the process at a constant value for
+    # the remainder of the series. Unit-range trend keeps the driving signal
+    # within the seasonal amplitude, preserving diversity in the test region.
+    trend = float(params["trend_slope"]) * np.linspace(0.0, 1.0, length, dtype=np.float64)
+    seasonal_signal = (
+        float(params["season_amp_1"]) * np.sin(2.0 * np.pi * np.arange(length) / p1)
+        + float(params["season_amp_2"]) * np.cos(2.0 * np.pi * np.arange(length) / max(int(round(params["season_period_2"])), 2))
+    )
+
+    eps = rng.normal(0.0, noise_scale, size=length).astype(np.float64)
+    phi1 = float(params["ar_coef_1"])
+    phi2 = float(params["ar_coef_2"])
+    phi3 = float(params["ar_coef_3"])
+    Phi1 = float(params.get("seasonal_ar_1", 0.0))
+    Phi2 = float(params.get("seasonal_ar_2", 0.0))
+
+    for t in range(length):
+        val = trend[t] + seasonal_signal[t] + eps[t]
+        if t - 1 >= 0:
+            val += phi1 * x[t - 1]
+        if t - 2 >= 0:
+            val += phi2 * x[t - 2]
+        if t - 3 >= 0:
+            val += phi3 * x[t - 3]
+        if t - p1 >= 0:
+            val += Phi1 * x[t - p1]
+        if t - 2 * p1 >= 0:
+            val += Phi2 * x[t - 2 * p1]
+        x[t] = np.clip(val, -20.0, 20.0)
+
+    return _sanitize_series(x)
+
+
+def _simulate_long_memory_series(
+    rng: np.random.Generator,
+    length: int,
+    params: Dict[str, float],
+) -> np.ndarray:
+    d = float(np.clip(params.get("long_memory_strength", 0.5), 0.0, 0.95))
+    noise_scale = max(float(params["noise_scale"]), 1e-6)
+
+    eps = rng.normal(0.0, noise_scale, size=length + 256).astype(np.float64)
+    max_lag = min(128, length)
+    weights = np.array([(k + 1) ** (-d) for k in range(max_lag)], dtype=np.float64)
+    weights = weights / max(weights.sum(), 1e-12)
+
+    x = np.zeros(length, dtype=np.float64)
+    base = _base_regime_series(rng, length, params).astype(np.float64)
+
+    for t in range(length):
+        mem = 0.0
+        for k in range(min(t + 1, max_lag)):
+            mem += weights[k] * eps[t - k + 128]
+        x[t] = base[t] + mem
+
+    return _sanitize_series(x)
+
+
+def _moving_average_smooth(x: np.ndarray, width: int) -> np.ndarray:
+    width = max(int(width), 1)
+    if width <= 1:
+        return np.asarray(x, dtype=np.float64)
+    kernel = np.ones(width, dtype=np.float64) / float(width)
+    return np.convolve(np.asarray(x, dtype=np.float64), kernel, mode="same")
+
+
+def _simulate_smooth_seasonal_series(
+    rng: np.random.Generator,
+    length: int,
+    params: Dict[str, float],
+) -> np.ndarray:
+    t = np.arange(length, dtype=np.float64)
+    p1 = max(float(params["season_period_1"]), 2.0)
+    p2 = max(float(params["season_period_2"]), 2.0)
+    smoothness = max(float(params.get("smoothness_strength", 1.0)), 0.1)
+
+    x = (
+        float(params["season_amp_1"]) * np.sin(2.0 * np.pi * t / p1)
+        + float(params["season_amp_2"]) * np.cos(2.0 * np.pi * t / p2)
+        + float(params["trend_slope"]) * np.linspace(0.0, 1.0, length, dtype=np.float64) * length * 0.5
+    )
+
+    noise = rng.normal(0.0, max(float(params["noise_scale"]), 1e-6), size=length).astype(np.float64)
+    x = x + noise
+    width = int(max(3, round(3 + 8 * smoothness)))
+    x = _moving_average_smooth(x, width)
+    return _sanitize_series(x)
+
+
+def _downsample_series(
+    x: np.ndarray,
+    factor: int,
+    target_length: int,
+) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    factor = max(int(factor), 1)
+    if factor == 1:
+        y = x
+    else:
+        usable = (x.size // factor) * factor
+        if usable < factor:
+            y = x
+        else:
+            y = x[:usable].reshape(-1, factor).mean(axis=1)
+
+    if y.size < target_length:
+        reps = (target_length + y.size - 1) // max(y.size, 1)
+        y = np.tile(y, reps)[:target_length]
+    else:
+        y = y[:target_length]
+    return _sanitize_series(y)
+
+
+def _simulate_low_frequency_series(
+    rng: np.random.Generator,
+    length: int,
+    params: Dict[str, float],
+) -> np.ndarray:
+    factor = int(round(params.get("downsample_factor", 4.0)))
+    fine_length = max(length * factor, length + 8)
+
+    base = _simulate_smooth_seasonal_series(rng, fine_length, params).astype(np.float64)
+    drift = float(params["trend_slope"]) * np.linspace(0.0, 1.0, fine_length, dtype=np.float64) * fine_length * 0.25
+    base = base + drift
+    return _downsample_series(base, factor=factor, target_length=length)
+
+
+def _simulate_multiplicative_seasonal_series(
+    rng: np.random.Generator,
+    length: int,
+    params: Dict[str, float],
+) -> np.ndarray:
+    t = np.arange(length, dtype=np.float64)
+    p1 = max(float(params["season_period_1"]), 2.0)
+    p2 = max(float(params["season_period_2"]), 2.0)
+    noise_scale = max(float(params["noise_scale"]), 1e-6)
+
+    # Build signal in log space so seasonality and trend interact multiplicatively.
+    log_trend = (
+        float(params["trend_slope"]) * np.linspace(0.0, 1.0, length, dtype=np.float64) * 2.0
+        + float(params["exp_trend_strength"]) * np.linspace(0.0, 1.0, length, dtype=np.float64)
+    )
+    log_seasonal = (
+        float(params["season_amp_1"]) * np.sin(2.0 * np.pi * t / p1)
+        + float(params["season_amp_2"]) * np.cos(2.0 * np.pi * t / p2)
+    )
+    ar_noise = simulate_ar_series(
+        rng, length,
+        [params["ar_coef_1"], params["ar_coef_2"], params["ar_coef_3"]],
+        noise_scale * 0.5,
+    )
+    level = np.exp(np.clip(log_trend + log_seasonal + 0.4 * ar_noise.astype(np.float64), -4.0, 4.0))
+
+    # Proportional noise: variance scales with current level.
+    het = max(float(params["heteroskedasticity"]), 0.0)
+    prop_noise = rng.normal(0.0, noise_scale, size=length).astype(np.float64)
+    x = level * (1.0 + het * prop_noise)
+    return _sanitize_series(x)
+
+
+def _simulate_high_frequency_series(
+    rng: np.random.Generator,
+    length: int,
+    params: Dict[str, float],
+) -> np.ndarray:
+    t = np.arange(length, dtype=np.float64)
+    p1 = max(float(params["season_period_1"]), 2.0)
+    p2 = max(float(params["season_period_2"]), 2.0)
+    noise_scale = max(float(params["noise_scale"]), 1e-6)
+
+    # Short-period seasonal baseline.
+    x = (
+        float(params["season_amp_1"]) * np.sin(2.0 * np.pi * t / p1)
+        + float(params["season_amp_2"]) * np.sin(2.0 * np.pi * t / p2 + np.pi / 3.0)
+    )
+    # Strong local AR — high autocorrelation at lag 1 teaches the model short-range dynamics.
+    ar_component = simulate_ar_series(
+        rng, length,
+        [params["ar_coef_1"], params["ar_coef_2"], params["ar_coef_3"]],
+        noise_scale,
+    )
+    x += ar_component.astype(np.float64)
+    x += float(params["trend_slope"]) * np.linspace(0.0, 1.0, length, dtype=np.float64) * length * 0.2
+    return _sanitize_series(x)
+
+
+def _generate_series_for_family(
+    rng: np.random.Generator,
+    length: int,
+    params: Dict[str, float],
+) -> np.ndarray:
+    family = params["family"]
+
+    if family == "trend_seasonal":
+        return _base_regime_series(rng, length, params)
+    if family == "sarima_like":
+        return _simulate_sarima_like_series(rng, length, params)
+    if family == "long_memory":
+        return _simulate_long_memory_series(rng, length, params)
+    if family == "smooth_seasonal":
+        return _simulate_smooth_seasonal_series(rng, length, params)
+    if family == "low_frequency":
+        return _simulate_low_frequency_series(rng, length, params)
+    if family == "multiplicative_seasonal":
+        return _simulate_multiplicative_seasonal_series(rng, length, params)
+    if family == "high_frequency":
+        return _simulate_high_frequency_series(rng, length, params)
+
+    return _base_regime_series(rng, length, params)
+
+
+def tsmixup(
+    rng: np.random.Generator,
+    base_series: List[np.ndarray],
+    out_count: int,
+    max_k: int = 3,
+    alpha: float = 0.7,
+) -> List[np.ndarray]:
+    if not base_series:
+        return []
+
+    series_len = len(base_series[0])
+    out = []
+
+    for _ in range(out_count):
+        k = int(rng.integers(1, max_k + 1))
+        idx = rng.choice(len(base_series), size=k, replace=True)
+        lam = rng.dirichlet(alpha=np.full(k, alpha, dtype=np.float64))
+        mix = np.zeros(series_len, dtype=np.float64)
+        for w, i in zip(lam, idx):
+            s = _sanitize_series(base_series[int(i)])
+            mix += float(w) * s.astype(np.float64)
+        out.append(_sanitize_series(mix[:series_len]))
+
+    return out
+
+
 def build_synthetic_client_series(cfg, seq_len: int) -> Tuple[List[Dict], torch.Tensor]:
     total_len = int(getattr(cfg, "synthetic_series_length", 4000))
+
+    long_horizon_factor = int(getattr(cfg, "synthetic_long_horizon_factor", 4))
+    context_margin = int(getattr(cfg, "synthetic_context_margin", 128))
+
     min_needed = max(
-        seq_len + cfg.horizon + getattr(cfg, "synthetic_context_margin", 128),
+        seq_len + cfg.horizon + context_margin,
         2 * (seq_len + cfg.horizon),
+        long_horizon_factor * (seq_len + cfg.horizon),
     )
     if total_len < min_needed:
         total_len = min_needed
@@ -593,6 +1107,14 @@ def build_synthetic_client_series(cfg, seq_len: int) -> Tuple[List[Dict], torch.
     client_features = []
 
     n_regimes, n_variants, _ = _get_synth_shape(cfg)
+    descriptor_set = str(getattr(cfg, "descriptor_set", "basic")).lower()
+    use_oracle_regime_id = bool(getattr(cfg, "use_oracle_regime_id", False))
+    separability = str(getattr(cfg, "synthetic_regime_separability", "medium")).lower()
+    feature_names = list(get_descriptor_feature_names(descriptor_set))
+    if use_oracle_regime_id:
+        feature_names.extend([f"oracle_regime_{i:02d}" for i in range(n_regimes)])
+    cfg.synthetic_feature_names = tuple(feature_names)
+
     n_gp = int(getattr(cfg, "synthetic_gp_samples_per_client", 16))
     n_series_per_client = int(getattr(cfg, "synthetic_series_per_client", 10))
 
@@ -600,18 +1122,21 @@ def build_synthetic_client_series(cfg, seq_len: int) -> Tuple[List[Dict], torch.
     for regime_id in range(n_regimes):
         for variant_id in range(n_variants):
             rng = np.random.default_rng(cfg.seed + 1000 + client_id)
-            params = _make_regime_params(regime_id, variant_id, n_regimes, cfg.seed)
+            config_variant = getattr(cfg, "synthetic_config_variant", "baseline")
+            params = _make_regime_params(
+                regime_id,
+                variant_id,
+                n_regimes,
+                cfg.seed,
+                config_variant,
+                separability=separability,
+            )
 
-            base_series = [
-                _sanitize_series(
-                    _base_regime_series(
-                        np.random.default_rng(cfg.seed + client_id * 100 + k),
-                        total_len,
-                        params,
-                    )
-                )
-                for k in range(n_series_per_client)
-            ]
+            base_series = []
+            for k in range(n_series_per_client):
+                srng = np.random.default_rng(cfg.seed + client_id * 100 + k)
+                s = _generate_series_for_family(srng, total_len, params)
+                base_series.append(_sanitize_series(s))
 
             ks_feat_accum = {
                 "kernel_linear": 0.0,
@@ -622,6 +1147,7 @@ def build_synthetic_client_series(cfg, seq_len: int) -> Tuple[List[Dict], torch.
 
             if getattr(cfg, "synthetic_use_kernel_synth", True):
                 gp_series = []
+                gp_weight = float(getattr(cfg, "synthetic_kernel_blend_weight", 0.35))
                 for _ in range(n_gp):
                     samp, feat = sample_kernel_synth_series(
                         rng,
@@ -630,9 +1156,17 @@ def build_synthetic_client_series(cfg, seq_len: int) -> Tuple[List[Dict], torch.
                         int(getattr(cfg, "synthetic_kernel_terms_max", 3)),
                         float(params["season_period_1"]),
                     )
-                    gp_series.append(_sanitize_series(samp))
+
+                    if params["family"] in {"smooth_seasonal", "low_frequency"}:
+                        width = int(max(3, round(params.get("downsample_factor", 1.0) + 2)))
+                        samp = _moving_average_smooth(samp, width)
+
+                    blended = (1.0 - gp_weight) * samp + gp_weight * base_series[int(rng.integers(0, len(base_series)))]
+                    gp_series.append(_sanitize_series(blended))
+
                     for k, v in feat.items():
                         ks_feat_accum[k] += float(v)
+
                 base_series.extend(gp_series)
 
             if getattr(cfg, "synthetic_use_mixup", True):
@@ -654,6 +1188,10 @@ def build_synthetic_client_series(cfg, seq_len: int) -> Tuple[List[Dict], torch.
                 "regime": f"regime_{regime_id:02d}",
                 "regime_variant": f"regime_{regime_id:02d}_variant_{variant_id:02d}",
                 "freq": "synthetic",
+                "family": params["family"],
+                "descriptor_set": descriptor_set,
+                "synthetic_regime_separability": separability,
+                "use_oracle_regime_id": use_oracle_regime_id,
                 **params,
                 **ks_feat_accum,
                 "n_raw_series": len(base_series),
@@ -666,7 +1204,12 @@ def build_synthetic_client_series(cfg, seq_len: int) -> Tuple[List[Dict], torch.
                 max_windows_per_series=int(
                     getattr(cfg, "client_feature_windows_per_series", 8)
                 ),
+                descriptor_set=descriptor_set,
             )
+            if use_oracle_regime_id:
+                oracle_feat = torch.zeros(n_regimes, dtype=torch.float32)
+                oracle_feat[regime_id] = 1.0
+                feat_vec = torch.cat([feat_vec, oracle_feat], dim=0)
             client_features.append(feat_vec.numpy())
             client_id += 1
 
@@ -674,7 +1217,7 @@ def build_synthetic_client_series(cfg, seq_len: int) -> Tuple[List[Dict], torch.
     return clients, feats
 
 
-def make_synthetic_clients(cfg, seq_len: int, batch_size: int):
+def make_synthetic_clients(cfg, seq_len: int, batch_size: int, return_feature_stats: bool = False):
     raw_clients, client_features = build_synthetic_client_series(cfg, seq_len=seq_len)
 
     clients = []
@@ -776,5 +1319,15 @@ def make_synthetic_clients(cfg, seq_len: int, batch_size: int):
         mu = client_features.mean(dim=0, keepdim=True)
         sd = client_features.std(dim=0, keepdim=True).clamp_min(1e-6)
         client_features = (client_features - mu) / sd
+    else:
+        mu = torch.zeros(1, client_features.shape[1])
+        sd = torch.ones(1, client_features.shape[1])
 
+    if return_feature_stats:
+        # Raw-feature stats, saved as client_feature_stats.pt so eval scripts
+        # can z-score out-of-distribution inputs the same way as training.
+        # The fallback (recomputing stats from the *normalized* features in
+        # server.pt) yields ~(0, 1) and leaves eval inputs unnormalized.
+        feature_stats = {"mean": mu.squeeze(0).clone(), "std": sd.squeeze(0).clone()}
+        return clients, meta_rows, client_features, feature_stats
     return clients, meta_rows, client_features
